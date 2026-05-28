@@ -7,6 +7,10 @@ import { createServer as createViteServer } from "vite";
 import { createRequire } from "module";
 import { GoogleGenAI, Type } from "@google/genai";
 import zlib from "zlib";
+import os from "os";
+import { initializeApp as initializeFirebaseApp } from "firebase/app";
+import { getFirestore as getFirebaseFirestore, doc, setDoc, getDoc, getDocs, collection, query, orderBy, deleteDoc } from "firebase/firestore";
+
 const require = createRequire(import.meta.url);
 
 let aiClient: GoogleGenAI | null = null;
@@ -115,11 +119,40 @@ function applyMetadataGenerators(metadata: any) {
 
 
 
-const DATA_DIR = path.join(process.cwd(), "data");
-const UPLOADS_DIR = path.join(process.cwd(), "data", "files");
-const DB_FILE = path.join(process.cwd(), "data", "passes.json");
+// Initialize Firebase Client
+let firebaseConfig: any;
+let firestoreDb: any = null;
+try {
+  firebaseConfig = require("./firebase-applet-config.json");
+  const firebaseApp = initializeFirebaseApp(firebaseConfig);
+  firestoreDb = getFirebaseFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId);
+  console.log("Firebase App & Firestore client initialized successfully.");
+} catch (err) {
+  console.error("Failed to initialize Firebase app / Firestore client:", err);
+}
 
-// Create directories and base database file on startup
+const TMP_PASSES_DIR = path.join(os.tmpdir(), "dc_passes_temp");
+if (!existsSync(TMP_PASSES_DIR)) {
+  mkdirSync(TMP_PASSES_DIR, { recursive: true });
+}
+
+let DATA_DIR = path.join(process.cwd(), "data");
+let UPLOADS_DIR = path.join(process.cwd(), "data", "files");
+let DB_FILE = path.join(process.cwd(), "data", "passes.json");
+
+// Robust check for read-only filesystem
+try {
+  mkdirSync(DATA_DIR, { recursive: true });
+  const testFile = path.join(DATA_DIR, ".write_test");
+  writeFileSync(testFile, "test");
+  fs.unlink(testFile).catch(() => {});
+} catch (e) {
+  console.warn("Detected read-only workspace filesystem. Diverting native storage to /tmp.");
+  DATA_DIR = path.join(os.tmpdir(), "dc_passes", "data");
+  UPLOADS_DIR = path.join(os.tmpdir(), "dc_passes", "data", "files");
+  DB_FILE = path.join(os.tmpdir(), "dc_passes", "data", "passes.json");
+}
+
 if (!existsSync(DATA_DIR)) {
   mkdirSync(DATA_DIR, { recursive: true });
 }
@@ -128,6 +161,113 @@ if (!existsSync(UPLOADS_DIR)) {
 }
 if (!existsSync(DB_FILE)) {
   writeFileSync(DB_FILE, JSON.stringify({ passes: [] }, null, 2));
+}
+
+// -------------------------------------------------------------
+// Unified Database Synchronization with Firebase Firestore
+// -------------------------------------------------------------
+async function syncDatabaseWithFirestore() {
+  if (!firestoreDb) return;
+  try {
+    console.log("Synchronizing passes database with Firebase Firestore...");
+    let localPasses: any[] = [];
+    if (existsSync(DB_FILE)) {
+      try {
+        const localContent = await fs.readFile(DB_FILE, "utf-8");
+        localPasses = JSON.parse(localContent).passes || [];
+      } catch (err) {
+        console.warn("Failed to parse local passes.json, using Firestore raw data.");
+      }
+    }
+
+    const passesCol = collection(firestoreDb, "passes");
+    const snapshot = await getDocs(passesCol);
+    
+    const firestorePasses: any[] = [];
+    snapshot.forEach((docSnap) => {
+      const data = docSnap.data();
+      // Exclude heavy fileDataB64 for passes listings
+      const { fileDataB64, ...metadataOnly } = data;
+      firestorePasses.push({
+        ...metadataOnly,
+        id: docSnap.id
+      });
+    });
+
+    console.log(`Initial status: ${localPasses.length} local records | ${firestorePasses.length} cloud records.`);
+
+    if (firestorePasses.length === 0 && localPasses.length > 0) {
+      console.log("Empty cloud. Populating Firebase with local records...");
+      for (const pass of localPasses) {
+        const docRef = doc(firestoreDb, "passes", pass.id);
+        const fileLocalPath = path.join(UPLOADS_DIR, `${pass.id}.bin`);
+        let fileDataB64 = "";
+        if (existsSync(fileLocalPath)) {
+          try {
+            const buf = await fs.readFile(fileLocalPath);
+            const compressed = zlib.deflateSync(buf);
+            if (compressed.length < 900000) {
+              fileDataB64 = compressed.toString("base64");
+            }
+          } catch (e) {
+            console.warn(`File compress failed for pass ${pass.id}:`, e);
+          }
+        }
+        await setDoc(docRef, {
+          ...pass,
+          fileDataB64
+        }, { merge: true });
+      }
+    } else {
+      // Merge records
+      const mergedPasses = [...firestorePasses];
+      for (const localPass of localPasses) {
+        if (!mergedPasses.some(p => p.id === localPass.id)) {
+          mergedPasses.push(localPass);
+          try {
+            const docRef = doc(firestoreDb, "passes", localPass.id);
+            const fileLocalPath = path.join(UPLOADS_DIR, `${localPass.id}.bin`);
+            let fileDataB64 = "";
+            if (existsSync(fileLocalPath)) {
+              const buf = await fs.readFile(fileLocalPath);
+              const compressed = zlib.deflateSync(buf);
+              if (compressed.length < 900000) {
+                fileDataB64 = compressed.toString("base64");
+              }
+            }
+            await setDoc(docRef, {
+              ...localPass,
+              fileDataB64
+            }, { merge: true });
+          } catch (e) {
+            console.error(`Local sync item upload error for ID ${localPass.id}:`, e);
+          }
+        }
+      }
+
+      await fs.writeFile(DB_FILE, JSON.stringify({ passes: mergedPasses }, null, 2));
+      console.log(`Database synchronized. Total passes: ${mergedPasses.length}`);
+    }
+  } catch (err: any) {
+    console.error("Firestore sync loop failed:", err);
+  }
+}
+
+// Call sync on start with delay
+setTimeout(() => {
+  syncDatabaseWithFirestore();
+}, 2000);
+
+const pdfParse = require("pdf-parse");
+
+async function parsePdfText(buffer: Buffer): Promise<string> {
+  try {
+    const data = await pdfParse(buffer);
+    return data.text || "";
+  } catch (err) {
+    console.warn("pdf-parse failed, falling back to regex parser:", err);
+    return extractRawPDFTextFallback(buffer);
+  }
 }
 
 // Pure JS custom regex-based fallback to extract readable strings from PDF binary stream if library fails
@@ -348,8 +488,8 @@ async function extractDCPassDetails(fileBase64: string, mimeType: string) {
   if (mimeType.toLowerCase().includes("pdf")) {
     try {
       const dataBuffer = Buffer.from(fileBase64, "base64");
-      console.log("Parsing PDF using fast, safe, zero-dependency native regex stream scanner...");
-      text = extractRawPDFTextFallback(dataBuffer);
+      console.log("Parsing PDF using fast, robust pdf-parse engine...");
+      text = await parsePdfText(dataBuffer);
     } catch (globalErr) {
       console.warn("PDF stream scanning failed:", globalErr);
     }
@@ -442,20 +582,30 @@ async function extractDCPassDetails(fileBase64: string, mimeType: string) {
   return metadata;
 }
 
-async function startServer() {
-  const app = express();
-  const PORT = 3000;
-  const isProd = process.env.NODE_ENV === "production";
+const app = express();
 
-  // Enable CORS & handle preflight OPTIONS requests to prevent 405 Method Not Allowed errors
+
+  // Enable CORS & handle preflight OPTIONS requests comprehensively to prevent 405 Method Not Allowed errors
   app.use((req, res, next) => {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+    res.setHeader("Access-Control-Allow-Origin", req.headers.origin || "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH");
+    res.setHeader("Access-Control-Allow-Headers", req.headers["access-control-request-headers"] || "Content-Type, Authorization, X-Requested-With, Accept, Origin");
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+    res.setHeader("Access-Control-Max-Age", "86400"); // 24 hours preflight cache
     if (req.method === "OPTIONS") {
-      return res.status(200).end();
+      return res.status(204).end();
     }
     next();
+  });
+
+  // Handle explicit route-level preflight OPTIONS requests
+  app.options("*", (req, res) => {
+    res.setHeader("Access-Control-Allow-Origin", req.headers.origin || "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH");
+    res.setHeader("Access-Control-Allow-Headers", req.headers["access-control-request-headers"] || "Content-Type, Authorization, X-Requested-With, Accept, Origin");
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+    res.setHeader("Access-Control-Max-Age", "86400");
+    res.status(204).end();
   });
 
   // Use JSON bodyParser with higher limits to support base64 uploads
@@ -474,25 +624,72 @@ async function startServer() {
     });
     next();
   });
-  app.use(express.json({ limit: "25mb" }));
+  app.use(express.json({ limit: "100mb" }));
+  app.use(express.urlencoded({ limit: "100mb", extended: true }));
 
   // API Route - Health Check
-  app.get("/api/health", (req, res) => {
+  app.get(["/api/health", "/health", "/api/health/", "/health/"], (req, res) => {
     res.json({ status: "ok" });
   });
 
+  // Helper to load unified and live synchronized passes lists.
+  async function loadPassesUnified(): Promise<any[]> {
+    let localPasses: any[] = [];
+    if (existsSync(DB_FILE)) {
+      try {
+        const content = await fs.readFile(DB_FILE, "utf-8");
+        localPasses = JSON.parse(content).passes || [];
+      } catch (e) {
+        console.warn("Failed to parse DB_FILE:", e);
+      }
+    }
+
+    if (firestoreDb) {
+      try {
+        const passesCol = collection(firestoreDb, "passes");
+        const snapshot = await getDocs(passesCol);
+        const firestorePasses: any[] = [];
+        snapshot.forEach((docSnap) => {
+          const data = docSnap.data();
+          const { fileDataB64, ...metadataOnly } = data;
+          firestorePasses.push({
+            ...metadataOnly,
+            id: docSnap.id
+          });
+        });
+
+        const merged = [...firestorePasses];
+        for (const localPass of localPasses) {
+          if (!merged.some(p => p.id === localPass.id)) {
+            merged.push(localPass);
+          }
+        }
+
+        merged.sort((a: any, b: any) => {
+          const d1 = new Date(a.createdAt || 0).getTime();
+          const d2 = new Date(b.createdAt || 0).getTime();
+          return d2 - d1;
+        });
+
+        fs.writeFile(DB_FILE, JSON.stringify({ passes: merged }, null, 2)).catch(() => {});
+        return merged;
+      } catch (dbErr) {
+        console.error("Firestore live fetch error on pass listing:", dbErr);
+      }
+    }
+
+    localPasses.sort((a: any, b: any) => {
+      const d1 = new Date(a.createdAt || 0).getTime();
+      const d2 = new Date(b.createdAt || 0).getTime();
+      return d2 - d1;
+    });
+    return localPasses;
+  }
+
   // API Route - Get Passes
-  app.get("/api/passes", async (req, res) => {
+  app.get(["/api/passes", "/passes", "/api/passes/", "/passes/"], async (req, res) => {
     try {
-      const content = await fs.readFile(DB_FILE, "utf-8");
-      const db = JSON.parse(content);
-      const list = db.passes || [];
-      // Sort by createdAt desc
-      const sorted = list.sort((a: any, b: any) => {
-        const d1 = new Date(a.createdAt || 0).getTime();
-        const d2 = new Date(b.createdAt || 0).getTime();
-        return d2 - d1;
-      });
+      const sorted = await loadPassesUnified();
       res.json(sorted);
     } catch (e: any) {
       console.error("Failed to fetch passes:", e);
@@ -501,14 +698,13 @@ async function startServer() {
   });
 
   // API Route - Get Pass Details by ID
-  app.get("/api/passes/:id", async (req, res) => {
+  app.get(["/api/passes/:id", "/passes/:id"], async (req, res) => {
     try {
       const idStr = req.params.id;
       const decoded = decodeURIComponent(idStr);
-      const content = await fs.readFile(DB_FILE, "utf-8");
-      const db = JSON.parse(content);
+      const list = await loadPassesUnified();
       
-      const found = (db.passes || []).find((p: any) => {
+      const found = list.find((p: any) => {
         const pId = String(p.id || '').toLowerCase();
         const pDc = String(p.dcPassNo || '').toLowerCase();
         const queryStr = idStr.toLowerCase();
@@ -536,7 +732,7 @@ async function startServer() {
   });
 
   // API Route - Save Pass
-  app.post("/api/passes", async (req, res) => {
+  app.post(["/api/passes", "/passes", "/api/passes/", "/passes/"], async (req, res) => {
     try {
       const { metadata, fileBase64, uploadId, originalFormat } = req.body;
       if (!metadata || !metadata.dcPassNo) {
@@ -547,44 +743,64 @@ async function startServer() {
       const createdAt = new Date().toISOString();
 
       let fileSize = 0;
+      let finalBuffer: Buffer | null = null;
       const filePath = path.join(UPLOADS_DIR, `${sanitizedId}.bin`);
 
       if (uploadId) {
-        const assembledPath = path.join(UPLOADS_DIR, "temp", `${uploadId}_assembled.bin`);
+        const assembledPath = path.join(TMP_PASSES_DIR, `${uploadId}_assembled.bin`);
         if (existsSync(assembledPath)) {
-          const stats = await fs.stat(assembledPath);
-          fileSize = stats.size;
-          await fs.rename(assembledPath, filePath);
+          finalBuffer = await fs.readFile(assembledPath);
+          fileSize = finalBuffer.length;
+          await fs.writeFile(filePath, finalBuffer);
+          await fs.unlink(assembledPath).catch(() => {});
         } else {
-          // As a fallback, try to read the chunk folder
-          const tempDir = path.join(UPLOADS_DIR, "temp", uploadId);
+          // Fallback to reading the local tmp chunk folder
+          const tempDir = path.join(TMP_PASSES_DIR, uploadId);
+          let chunkDataMap: { [key: number]: string } = {};
           if (existsSync(tempDir)) {
             const files = await fs.readdir(tempDir);
-            const chunkFiles = files.filter(f => f.startsWith("chunk_")).sort((a,b) => {
-              const numA = parseInt(a.substring(6));
-              const numB = parseInt(b.substring(6));
-              return numA - numB;
-            });
-            const buffers = [];
+            const chunkFiles = files.filter(f => f.startsWith("chunk_"));
             for (const f of chunkFiles) {
+              const chunkIdx = parseInt(f.substring(6));
               const chunkContent = await fs.readFile(path.join(tempDir, f), "utf-8");
-              buffers.push(Buffer.from(chunkContent, "base64"));
+              chunkDataMap[chunkIdx] = chunkContent;
             }
-            const buffer = Buffer.concat(buffers);
-            fileSize = buffer.length;
-            await fs.writeFile(filePath, buffer);
+          }
+
+          // Fallback to querying Firestore chunks if local tmp is gone (e.g., scale out container swap)
+          if (firestoreDb && Object.keys(chunkDataMap).length === 0) {
+            try {
+              const snapshot = await getDocs(collection(firestoreDb, "temp_chunks"));
+              snapshot.forEach((docSnap) => {
+                const data = docSnap.data();
+                if (data.uploadId === uploadId) {
+                  chunkDataMap[data.chunkIndex] = data.chunkData;
+                }
+              });
+            } catch (dbErr) {
+              console.error("Database fallback retrieve error:", dbErr);
+            }
+          }
+
+          if (Object.keys(chunkDataMap).length > 0) {
+            const sortedIndexes = Object.keys(chunkDataMap).map(Number).sort((a, b) => a - b);
+            const buffers = sortedIndexes.map(idx => Buffer.from(chunkDataMap[idx], "base64"));
+            finalBuffer = Buffer.concat(buffers);
+            fileSize = finalBuffer.length;
+            await fs.writeFile(filePath, finalBuffer);
           }
         }
         
         // Clean up temp dir if exists
-        const tempDir = path.join(UPLOADS_DIR, "temp", uploadId);
+        const tempDir = path.join(TMP_PASSES_DIR, uploadId);
         if (existsSync(tempDir)) {
           await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
         }
       } else if (fileBase64) {
-        const buffer = Buffer.from(fileBase64, "base64");
-        fileSize = buffer.length;
-        await fs.writeFile(filePath, buffer);
+        const cleanB64 = fileBase64.includes("base64,") ? fileBase64.split("base64,")[1] : fileBase64;
+        finalBuffer = Buffer.from(cleanB64, "base64");
+        fileSize = finalBuffer.length;
+        await fs.writeFile(filePath, finalBuffer);
       }
 
       const passRecord = {
@@ -598,6 +814,30 @@ async function startServer() {
         pdfDownloaded: true
       };
 
+      // Save in Firestore with Deflate-Compressed base64 for absolute persistence resilience!
+      if (firestoreDb) {
+        try {
+          let fileDataB64 = "";
+          if (finalBuffer) {
+            const compressed = zlib.deflateSync(finalBuffer);
+            if (compressed.length < 900000) {
+              fileDataB64 = compressed.toString("base64");
+            } else {
+              console.warn(`File compressed size ${compressed.length} exceeds standard Firestore document chunk limit.`);
+            }
+          }
+          const docRef = doc(firestoreDb, "passes", sanitizedId);
+          await setDoc(docRef, {
+            ...passRecord,
+            fileDataB64
+          }, { merge: true });
+          console.log(`Pass ${sanitizedId} saved securely to Firebase Firestore.`);
+        } catch (dbErr) {
+          console.error("Could not upload pass record to Firestore:", dbErr);
+        }
+      }
+
+      // Save locally to database.json
       const content = await fs.readFile(DB_FILE, "utf-8");
       const db = JSON.parse(content);
       db.passes = (db.passes || []).filter((p: any) => p.id !== sanitizedId && p.dcPassNo !== metadata.dcPassNo);
@@ -612,24 +852,55 @@ async function startServer() {
   });
 
   // API Route - Download / Serve original file mapping
-  app.get("/api/passes/:id/file", async (req, res) => {
+  app.get(["/api/passes/:id/file", "/passes/:id/file"], async (req, res) => {
     try {
       const idStr = req.params.id;
       const sanitizedId = idStr.replace(/\//g, '_');
       const filePath = path.join(UPLOADS_DIR, `${sanitizedId}.bin`);
       
+      let finalBuffer: Buffer | null = null;
+      let mimeType = "application/pdf";
+
       if (existsSync(filePath)) {
-        const jsonContent = await fs.readFile(DB_FILE, "utf-8");
-        const db = JSON.parse(jsonContent);
-        const found = (db.passes || []).find((p: any) => p.id === sanitizedId || p.id === idStr);
-        const mimeType = found?.originalFormat || "application/octet-stream";
-        
-        const fileBuffer = await fs.readFile(filePath);
+        finalBuffer = await fs.readFile(filePath);
+      } else if (firestoreDb) {
+        // Self-Healing Trigger: Pull compressed file from Firestore if missing locally!
+        console.log(`Local file missing for pass ${sanitizedId}. Restoring from Firestore cloud...`);
+        try {
+          const docRef = doc(firestoreDb, "passes", sanitizedId);
+          const docSnap = await getDoc(docRef);
+          if (docSnap.exists()) {
+            const data = docSnap.data();
+            mimeType = data.originalFormat || "application/pdf";
+            if (data.fileDataB64) {
+              const compressedBuf = Buffer.from(data.fileDataB64, "base64");
+              finalBuffer = zlib.inflateSync(compressedBuf);
+              // Cache locally so we don't have to decompress every download
+              await fs.writeFile(filePath, finalBuffer);
+              console.log(`Restored and cached local file from Firestore backup for id: ${sanitizedId}`);
+            }
+          }
+        } catch (dbErr) {
+          console.error("Firestore self-healing restore aborted:", dbErr);
+        }
+      }
+
+      if (finalBuffer) {
+        // Try resolving precise mimeType from local database record
+        try {
+          const jsonContent = await fs.readFile(DB_FILE, "utf-8");
+          const db = JSON.parse(jsonContent);
+          const found = (db.passes || []).find((p: any) => p.id === sanitizedId || p.id === idStr);
+          if (found) mimeType = found.originalFormat || mimeType;
+        } catch (e) {
+          // ignore database parse fail
+        }
+
         res.setHeader("Content-Type", mimeType);
         res.setHeader("Content-Disposition", `attachment; filename="Pass-${sanitizedId}.pdf"`);
-        res.send(fileBuffer);
+        res.send(finalBuffer);
       } else {
-        res.status(404).json({ error: "File not found on the local server" });
+        res.status(404).json({ error: "File could not be recovered or found on local server nor Cloud Storage." });
       }
     } catch (e: any) {
       console.error("Failed to download file:", e);
@@ -638,19 +909,32 @@ async function startServer() {
   });
 
   // API Route - Delete Pass
-  app.delete("/api/passes/:id", async (req, res) => {
+  app.delete(["/api/passes/:id", "/passes/:id"], async (req, res) => {
     try {
       const idStr = req.params.id;
       const sanitizedId = idStr.replace(/\//g, '_');
       
+      // Delete from local database file
       const content = await fs.readFile(DB_FILE, "utf-8");
       const db = JSON.parse(content);
       db.passes = (db.passes || []).filter((p: any) => p.id !== sanitizedId && p.id !== idStr);
       await fs.writeFile(DB_FILE, JSON.stringify(db, null, 2));
 
+      // Delete from local disk
       const filePath = path.join(UPLOADS_DIR, `${sanitizedId}.bin`);
       if (existsSync(filePath)) {
-        await fs.unlink(filePath);
+        await fs.unlink(filePath).catch(() => {});
+      }
+
+      // Delete from Firestore
+      if (firestoreDb) {
+        try {
+          const docRef = doc(firestoreDb, "passes", sanitizedId);
+          await deleteDoc(docRef);
+          console.log(`Pass document ${sanitizedId} deleted from Firestore.`);
+        } catch (dbErr) {
+          console.error("Firestore document deletion failed:", dbErr);
+        }
       }
 
       res.json({ success: true });
@@ -661,20 +945,37 @@ async function startServer() {
   });
 
   // API Route - Chunked Upload Endpoint (supports multiple route structures for cache compatibility)
-  app.post(["/api/passes/upload-chunk", "/api/upload-chunk"], async (req, res) => {
+  app.post(["/api/passes/upload-chunk", "/api/upload-chunk", "/passes/upload-chunk", "/upload-chunk", "/api/passes/upload-chunk/", "/api/upload-chunk/", "/passes/upload-chunk/", "/upload-chunk/"], async (req, res) => {
     try {
       const { uploadId, chunkIndex, totalChunks, chunkData } = req.body;
       if (!uploadId || chunkIndex === undefined || !chunkData) {
         return res.status(400).json({ error: "uploadId, chunkIndex, and chunkData are required" });
       }
 
-      const tempDir = path.join(UPLOADS_DIR, "temp", uploadId);
+      // Write locally in writable /tmp
+      const tempDir = path.join(TMP_PASSES_DIR, uploadId);
       if (!existsSync(tempDir)) {
         mkdirSync(tempDir, { recursive: true });
       }
 
       const chunkPath = path.join(tempDir, `chunk_${chunkIndex}`);
       await fs.writeFile(chunkPath, chunkData, "utf8");
+
+      // Save to Firestore for multi-instance distributed serverless fallback
+      if (firestoreDb) {
+        try {
+          const docRef = doc(firestoreDb, "temp_chunks", `${uploadId}_${chunkIndex}`);
+          await setDoc(docRef, {
+            uploadId,
+            chunkIndex,
+            totalChunks,
+            chunkData,
+            createdAt: Date.now()
+          });
+        } catch (dbErr) {
+          console.warn("Could not sync uploaded chunk to Firestore:", dbErr);
+        }
+      }
 
       res.json({ success: true, chunkIndex });
     } catch (e: any) {
@@ -684,50 +985,79 @@ async function startServer() {
   });
 
   // API Route - Extract details from chunked file (supports multiple route structures for cache compatibility)
-  app.post(["/api/passes/extract-chunked", "/api/extract-chunked"], async (req, res) => {
+  app.post(["/api/passes/extract-chunked", "/api/extract-chunked", "/passes/extract-chunked", "/extract-chunked", "/api/passes/extract-chunked/", "/api/extract-chunked/", "/passes/extract-chunked/", "/extract-chunked/"], async (req, res) => {
     try {
       const { uploadId, mimeType } = req.body;
       if (!uploadId || !mimeType) {
         return res.status(400).json({ error: "uploadId and mimeType are required" });
       }
 
-      const tempDir = path.join(UPLOADS_DIR, "temp", uploadId);
-      if (!existsSync(tempDir)) {
-        return res.status(404).json({ error: "Upload session not found or expired" });
+      let chunkDataMap: { [key: number]: string } = {};
+      let totalCount = 0;
+
+      // 1. Try reading chunks locally from /tmp first
+      const tempDir = path.join(TMP_PASSES_DIR, uploadId);
+      if (existsSync(tempDir)) {
+        const files = await fs.readdir(tempDir);
+        const chunkFiles = files.filter(f => f.startsWith("chunk_"));
+        for (const f of chunkFiles) {
+          const chunkIdx = parseInt(f.substring(6));
+          const chunkContent = await fs.readFile(path.join(tempDir, f), "utf-8");
+          chunkDataMap[chunkIdx] = chunkContent;
+        }
+        totalCount = Object.keys(chunkDataMap).length;
+      }
+
+      // 2. Multi-instance Distributed Fallback: If local chunks are missing, pull from Firestore
+      if (firestoreDb && totalCount === 0) {
+        console.log(`Chunks not found in local /tmp for ${uploadId}. Fetching from Firestore fallback...`);
+        try {
+          const snapshot = await getDocs(collection(firestoreDb, "temp_chunks"));
+          snapshot.forEach((docSnap) => {
+            const data = docSnap.data();
+            if (data.uploadId === uploadId) {
+              chunkDataMap[data.chunkIndex] = data.chunkData;
+            }
+          });
+          totalCount = Object.keys(chunkDataMap).length;
+        } catch (dbErr) {
+          console.error("Firestore chunk fetch failed:", dbErr);
+        }
+      }
+
+      if (totalCount === 0) {
+        return res.status(400).json({ error: "No chunk files found for this upload session. Please re-upload the file." });
       }
 
       // Re-assemble files
-      const files = await fs.readdir(tempDir);
-      const chunkFiles = files.filter(f => f.startsWith("chunk_")).sort((a,b) => {
-        const numA = parseInt(a.substring(6));
-        const numB = parseInt(b.substring(6));
-        return numA - numB;
-      });
-
-      if (chunkFiles.length === 0) {
-        return res.status(400).json({ error: "No chunks uploaded yet" });
-      }
-
-      const buffers = [];
-      for (const f of chunkFiles) {
-        const chunkContent = await fs.readFile(path.join(tempDir, f), "utf-8");
-        buffers.push(Buffer.from(chunkContent, "base64"));
-      }
-
+      const sortedIndexes = Object.keys(chunkDataMap).map(Number).sort((a,b) => a - b);
+      const buffers = sortedIndexes.map(idx => Buffer.from(chunkDataMap[idx], "base64"));
       const fullBuffer = Buffer.concat(buffers);
       const fileBase64 = fullBuffer.toString("base64");
 
       // Save the assembled file temporarily so the /api/passes (save) route can find and move it
-      const assembledPath = path.join(UPLOADS_DIR, "temp", `${uploadId}_assembled.bin`);
-      const tempParentDir = path.join(UPLOADS_DIR, "temp");
-      if (!existsSync(tempParentDir)) {
-        mkdirSync(tempParentDir, { recursive: true });
-      }
+      const assembledPath = path.join(TMP_PASSES_DIR, `${uploadId}_assembled.bin`);
       await fs.writeFile(assembledPath, fullBuffer);
 
       // Now run the actual extraction on the assembled file as Base64
       console.log(`Starting metadata extraction on assembled PDF of size ${fullBuffer.length} bytes...`);
       const extractedData = await extractDCPassDetails(fileBase64, mimeType);
+
+      // Async clean up Firestore temporary chunks
+      if (firestoreDb) {
+        try {
+          const snapshot = await getDocs(collection(firestoreDb, "temp_chunks"));
+          snapshot.forEach(async (docSnap) => {
+            const data = docSnap.data();
+            if (data.uploadId === uploadId) {
+              await deleteDoc(doc(firestoreDb, "temp_chunks", docSnap.id)).catch(() => {});
+            }
+          });
+        } catch (cleanErr) {
+          console.warn("Could not clean temp chunks from Firestore asynchronously:", cleanErr);
+        }
+      }
+
       res.json(extractedData);
     } catch (e: any) {
       console.error("Chunked extraction error:", e);
@@ -736,7 +1066,7 @@ async function startServer() {
   });
 
   // API Route - Mineral Dispatch Pass Free Extractor
-  app.post("/api/passes/extract", async (req, res) => {
+  app.post(["/api/passes/extract", "/passes/extract", "/api/passes/extract/", "/passes/extract/"], async (req, res) => {
     try {
       const { fileBase64, mimeType } = req.body;
       if (!fileBase64 || !mimeType) {
@@ -755,7 +1085,7 @@ async function startServer() {
   });
 
   // Keep old endpoint for backwards compatibility
-  app.post("/api/gemini/extract", async (req, res) => {
+  app.post(["/api/gemini/extract", "/gemini/extract", "/api/gemini/extract/", "/gemini/extract/"], async (req, res) => {
     try {
       const { fileBase64, mimeType } = req.body;
       if (!fileBase64 || !mimeType) {
@@ -774,55 +1104,64 @@ async function startServer() {
   });
 
   // Catch-all handler for unhandled API requests to prevent leaking into Vite middleware (which results in 405 Method Not Allowed)
-  app.all("/api/*", (req, res) => {
+  app.all(["/api/*", "/passes/*", "/gemini/*", "/upload-chunk*", "/extract-chunked*"], (req, res) => {
     res.status(404).json({
       error: "API Endpoint not found",
       message: `The API route ${req.method} ${req.url} does not exist or matches nothing on the main Express server.`
     });
   });
 
-  let vite: any;
-  if (!isProd) {
-    vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
+  async function startLocalServer() {
+    const PORT = 3000;
+    const isProd = process.env.NODE_ENV === "production";
+
+    let vite: any;
+    if (!isProd) {
+      vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: "spa",
+      });
+      app.use(vite.middlewares);
+    } else {
+      const distPath = path.join(process.cwd(), 'dist');
+      app.use(express.static(distPath));
+    }
+
+    // SPA Fallback: Serve index.html for any request that hasn't been handled
+    app.get('*', async (req, res, next) => {
+      const url = req.originalUrl;
+      
+      // Ignore API routes
+      if (url.startsWith('/api/')) {
+        return next();
+      }
+
+      try {
+        if (isProd) {
+          const distPath = path.join(process.cwd(), 'dist');
+          const indexPath = path.join(distPath, 'index.html');
+          return res.sendFile(indexPath);
+        } else {
+          const templatePath = path.resolve(process.cwd(), 'index.html');
+          let template = await fs.readFile(templatePath, 'utf-8');
+          template = await vite.transformIndexHtml(url, template);
+          return res.status(200).set({ 'Content-Type': 'text/html' }).end(template);
+        }
+      } catch (e: any) {
+        console.error("Fallback error:", e);
+        if (!isProd && vite) vite.ssrFixStacktrace(e);
+        next(e);
+      }
     });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
+
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`Server running on http://localhost:${PORT}`);
+    });
   }
 
-  // SPA Fallback: Serve index.html for any request that hasn't been handled
-  app.get('*', async (req, res, next) => {
-    const url = req.originalUrl;
-    
-    // Ignore API routes
-    if (url.startsWith('/api/')) {
-      return next();
-    }
+  if (process.env.VERCEL !== "1") {
+    startLocalServer();
+  }
 
-    try {
-      if (isProd) {
-        const distPath = path.join(process.cwd(), 'dist');
-        const indexPath = path.join(distPath, 'index.html');
-        return res.sendFile(indexPath);
-      } else {
-        const templatePath = path.resolve(process.cwd(), 'index.html');
-        let template = await fs.readFile(templatePath, 'utf-8');
-        template = await vite.transformIndexHtml(url, template);
-        return res.status(200).set({ 'Content-Type': 'text/html' }).end(template);
-      }
-    } catch (e: any) {
-      console.error("Fallback error:", e);
-      if (!isProd && vite) vite.ssrFixStacktrace(e);
-      next(e);
-    }
-  });
+  export default app;
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-  });
-}
-
-startServer();
