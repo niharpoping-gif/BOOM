@@ -1,0 +1,40 @@
+{
+  "entities": {
+    "DCPass": {
+      "title": "DC Pass",
+      "description": "Information extracted from a DC Pass document.",
+      "type": "object",
+      "properties": {
+        "royaltyIssuedOn": { "type": "string" },
+        "dcPassNo": { "type": "string" },
+        "vehicleNo": { "type": "string" },
+        "mineralName": { "type": "string" },
+        "netWeight": { "type": "string" },
+        "concessionHolderName": { "type": "string" },
+        "sourcePlace": { "type": "string" },
+        "purchaserName": { "type": "string" },
+        "destination": { "type": "string" },
+        "distance": { "type": "string" },
+        "journeyStart": { "type": "string" },
+        "journeyEnd": { "type": "string" },
+        "routeName": { "type": "string" },
+        "duration": { "type": "string" },
+        "driverName": { "type": "string" },
+        "driverLicense": { "type": "string" },
+        "driverMobile": { "type": "string" },
+        "panGstin": { "type": "string" },
+        "gpsDetails": { "type": "string" },
+        "transporterName": { "type": "string" },
+        "buyerMobile": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["dcPassNo", "vehicleNo", "mineralName"]
+    }
+  },
+  "firestore": {
+    "/passes/{passId}": {
+      "schema": "DCPass",
+      "description": "Stored DC passes."
+    }
+  }
+}

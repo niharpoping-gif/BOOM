@@ -1,0 +1,163 @@
+:root {
+  --primary-green: #5c6f1e;
+  --btn-purple: #6c2bd9;
+  --bg-gray: #f4f4f9;
+  --border-color: #dddddd;
+}
+
+body {
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  background: var(--bg-gray);
+  margin: 0 !important;
+  padding: 20px 10px !important;
+  color: #333;
+}
+
+/* MAIN CARD */
+.container {
+  max-width: 500px;
+  margin: 0 auto;
+  background: #fff;
+  padding: 20px;
+  border-radius: 8px;
+  box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+}
+
+/* HEADER */
+.header {
+  display: flex;
+  align-items: flex-start;
+  gap: 20px;
+  padding-bottom: 15px;
+  border-bottom: 3px solid var(--primary-green);
+  margin-bottom: 20px;
+}
+
+.logo-img {
+  width: 85px;
+  height: 85px;
+  object-fit: contain;
+  filter: drop-shadow(0 2px 4px rgba(0,0,0,0.05));
+}
+
+.logo-container {
+  min-width: 85px;
+  min-height: 85px;
+}
+
+.logo-fallback {
+  width: 85px;
+  height: 85px;
+  background: #f8fafc;
+  border: 2px solid #e2e8f0;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.header-text {
+  font-size: 11px;
+  line-height: 1.5;
+  color: #444;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.header-text strong {
+  font-size: 16px;
+  color: #1a1a1a;
+  display: block;
+  line-height: 1.1;
+  margin-bottom: 4px;
+  font-weight: 800;
+}
+
+/* GREEN BANNER */
+.banner {
+  background: var(--primary-green);
+  color: white;
+  text-align: center;
+  padding: 10px;
+  font-weight: bold;
+  margin: 15px 0;
+  font-size: 15px;
+  border-radius: 4px;
+  letter-spacing: 0.5px;
+}
+
+/* CONTENT SECTIONS */
+.section {
+  font-size: 13px;
+  margin: 10px 0;
+  line-height: 1.5;
+}
+
+.label {
+  font-weight: 700;
+  color: #555;
+  display: block;
+  margin-bottom: 2px;
+}
+
+.value {
+  color: #000;
+  word-break: break-all;
+}
+
+/* QR CODE */
+.qr-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  margin: 20px 0;
+}
+
+.qr-container canvas {
+  padding: 10px;
+  border: 1px solid #eee;
+  background: #fff;
+}
+
+.divider {
+  border-top: 1px dashed var(--border-color);
+  margin: 15px 0;
+}
+
+/* BUTTONS (Hidden during PDF export) */
+.btns {
+  display: flex;
+  gap: 10px;
+  margin-top: 20px;
+}
+
+button {
+  flex: 1;
+  padding: 12px;
+  border: none;
+  background: var(--btn-purple);
+  color: white;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: bold;
+  cursor: pointer;
+}
+
+button.back-btn {
+  background: #666;
+}
+
+/* FOOTER */
+.footer {
+  text-align: center;
+  font-size: 11px;
+  color: #888;
+  margin-top: 20px;
+  line-height: 1.4;
+}
+
+@media print {
+  .btns { display: none !important; }
+  body { background: white !important; padding: 0 !important; }
+  .container { box-shadow: none !important; border: none !important; max-width: 100% !important; margin: 0 !important; width: 100% !important; }
+}

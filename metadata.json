@@ -1,0 +1,8 @@
+{
+  "name": "DC Pass Viewer",
+  "description": "Automated DC Pass management portal. Upload mineral dispatch passes to extract transport details and verify authenticity immediately using local parse scanning.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
